@@ -22,6 +22,7 @@ static const char *miui_framework = "/system/framework/MiuiBooster.jar";
 static const char *task_name[] = {
 	"droid.launcher3",  // com.android.launcher3
 	"ion.XOSLauncher", // com.transsion.XOSLauncher
+	"sion.hilauncher", // com.transsion.hilauncher
 	"ndroid.systemui",  // com.android.systemui
 	// "surfaceflinger",
 	"cameraserver",
