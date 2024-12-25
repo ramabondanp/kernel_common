@@ -36,9 +36,9 @@ static struct policydb *get_policydb(void)
 	return db;
 }
 
-void apply_kernelsu_rules()
+void ksu_apply_kernelsu_rules()
 {
-	if (!getenforce()) {
+	if (!ksu_getenforce()) {
 		pr_info("SELinux permissive or disabled, apply rules!\n");
 	}
 
@@ -134,6 +134,20 @@ void apply_kernelsu_rules()
     ksu_allow(db, "system_server", KERNEL_SU_DOMAIN, "process", "getpgid");
     ksu_allow(db, "system_server", KERNEL_SU_DOMAIN, "process", "sigkill");
 
+#ifdef CONFIG_KSU_SUSFS
+#ifdef CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT
+	// https://github.com/5ec1cff/KernelSU/commit/2cbda5f963fcdb10dc570f49453f3a810ef57d35
+	// https://github.com/topjohnwu/Magisk/blob/c0899f2939a3b27a6173952f2b150b0eb04148c7/native/src/sepolicy/rules.rs#L133
+	ksu_deny(db, "init", "adb_data_file", "dir", "search");
+	ksu_deny(db, "vendor_init", "adb_data_file", "dir", "search");
+#endif // #ifdef CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT
+	// Allow umount in zygote process without installing zygisk
+	ksu_allow(db, "zygote", "labeledfs", "filesystem", "unmount");
+	susfs_set_init_sid();
+	susfs_set_ksu_sid();
+	susfs_set_zygote_sid();
+#endif
+
 	rcu_read_unlock();
 }
 
@@ -195,13 +209,13 @@ static void reset_avc_cache()
 	selinux_xfrm_notify_policyload();
 }
 
-int handle_sepolicy(unsigned long arg3, void __user *arg4)
+int ksu_handle_sepolicy(unsigned long arg3, void __user *arg4)
 {
 	if (!arg4) {
 		return -1;
 	}
 
-	if (!getenforce()) {
+	if (!ksu_getenforce()) {
 		pr_info("SELinux permissive or disabled when handle policy!\n");
 	}
 
