@@ -237,5 +237,5 @@ source "drivers/interconnect/Kconfig"
 source "drivers/counter/Kconfig"
 
 source "drivers/most/Kconfig"
-source "drivers/kernelsu/kernel/Kconfig"
+source "drivers/staging/kernelsu/kernel/Kconfig"
 endmenu
