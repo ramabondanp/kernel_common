@@ -19,8 +19,6 @@
 #endif
 
 static spinlock_t susfs_spin_lock;
-#define MAGIC_MOUNT_WORKDIR "/debug_ramdisk/workdir"
-static const size_t strlen_debug_ramdisk_workdir = strlen(MAGIC_MOUNT_WORKDIR);
 
 extern bool susfs_is_current_ksu_domain(void);
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
@@ -42,16 +40,26 @@ static DEFINE_HASHTABLE(SUS_PATH_HLIST, 10);
 static int susfs_update_sus_path_inode(char *target_pathname) {
 	struct path p;
 	struct inode *inode = NULL;
+	const char *dev_type;
 
 	if (kern_path(target_pathname, LOOKUP_FOLLOW, &p)) {
 		SUSFS_LOGE("Failed opening file '%s'\n", target_pathname);
 		return 1;
 	}
 
-	// We don't allow path of which filesystem type is "tmpfs", because its inode->i_ino is starting from 1 again,
-	// which will cause wrong comparison in function susfs_sus_ino_for_filldir64()
-	if (strcmp(p.mnt->mnt_sb->s_type->name, "tmpfs") == 0) {
-		SUSFS_LOGE("target_pathname: '%s' cannot be added since its filesystem is 'tmpfs'\n", target_pathname);
+	// - We don't allow paths of which filesystem type is "tmpfs" or "fuse".
+	//   For tmpfs, because its starting inode->i_ino will begin with 1 again,
+	//   so it will cause wrong comparison in function susfs_sus_ino_for_filldir64()
+	//   For fuse, which is almost storage related, sus_path should not handle any paths of
+	//   which filesystem is "fuse" as well, since app can write to "fuse" and lookup files via
+	//   like binder / system API (you can see the uid is changed to 1000)/
+	// - so sus_path should be applied only on read-only filesystem like "erofs" or "f2fs", but not "tmpfs" or "fuse",
+	//   people may rely on HMA for /data isolation instead.
+	dev_type = p.mnt->mnt_sb->s_type->name;
+	if (!strcmp(dev_type, "tmpfs") ||
+		!strcmp(dev_type, "fuse")) {
+		SUSFS_LOGE("target_pathname: '%s' cannot be added since its filesystem type is '%s'\n",
+						target_pathname, dev_type);
 		path_put(&p);
 		return 1;
 	}
@@ -63,10 +71,11 @@ static int susfs_update_sus_path_inode(char *target_pathname) {
 		return 1;
 	}
 
-	spin_lock(&inode->i_lock);
-	inode->i_state |= INODE_STATE_SUS_PATH;
-	spin_unlock(&inode->i_lock);
-
+	if (!(inode->i_state & INODE_STATE_SUS_PATH)) {
+		spin_lock(&inode->i_lock);
+		inode->i_state |= INODE_STATE_SUS_PATH;
+		spin_unlock(&inode->i_lock);
+	}
 	path_put(&p);
 	return 0;
 }
@@ -151,10 +160,11 @@ static void susfs_update_sus_mount_inode(char *target_pathname) {
 		return;
 	}
 
-	spin_lock(&inode->i_lock);
-	inode->i_state |= INODE_STATE_SUS_MOUNT;
-	spin_unlock(&inode->i_lock);
-
+	if (!(inode->i_state & INODE_STATE_SUS_MOUNT)) {
+		spin_lock(&inode->i_lock);
+		inode->i_state |= INODE_STATE_SUS_MOUNT;
+		spin_unlock(&inode->i_lock);
+	}
 	path_put(&p);
 }
 
@@ -214,23 +224,33 @@ int susfs_auto_add_sus_bind_mount(const char *pathname, struct path *path_target
 
 	inode = path_target->dentry->d_inode;
 	if (!inode) return 1;
-	spin_lock(&inode->i_lock);
-	inode->i_state |= INODE_STATE_SUS_MOUNT;
-	SUSFS_LOGI("set SUS_MOUNT inode state for source bind mount path '%s'\n", pathname);
-	spin_unlock(&inode->i_lock);
+	if (!(inode->i_state & INODE_STATE_SUS_MOUNT)) {
+		spin_lock(&inode->i_lock);
+		inode->i_state |= INODE_STATE_SUS_MOUNT;
+		spin_unlock(&inode->i_lock);
+		SUSFS_LOGI("set SUS_MOUNT inode state for source bind mount path '%s'\n", pathname);
+	}
 	return 0;
 }
 #endif // #ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
 
 #ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
 void susfs_auto_add_sus_ksu_default_mount(const char __user *to_pathname) {
-	char pathname[SUSFS_MAX_LEN_PATHNAME];
+	char *pathname = NULL;
 	struct path path;
 	struct inode *inode;
 
-	// Here we need to re-retrieve the struct path as we want the new struct path, not the old one
-	if (strncpy_from_user(pathname, to_pathname, SUSFS_MAX_LEN_PATHNAME-1) < 0)
+	pathname = kmalloc(SUSFS_MAX_LEN_PATHNAME, GFP_KERNEL);
+	if (!pathname) {
+		SUSFS_LOGE("no enough memory\n");
 		return;
+	}
+	// Here we need to re-retrieve the struct path as we want the new struct path, not the old one
+	if (strncpy_from_user(pathname, to_pathname, SUSFS_MAX_LEN_PATHNAME-1) < 0) {
+		SUSFS_LOGE("strncpy_from_user()\n");
+		goto out_free_pathname;
+		return;
+	}
 	if ((!strncmp(pathname, "/data/adb/modules", 17) ||
 		 !strncmp(pathname, "/debug_ramdisk", 14) ||
 		 !strncmp(pathname, "/system", 7) ||
@@ -241,17 +261,23 @@ void susfs_auto_add_sus_ksu_default_mount(const char __user *to_pathname) {
 		 !kern_path(pathname, LOOKUP_FOLLOW, &path)) {
 		goto set_inode_sus_mount;
 	}
-	return;
+	goto out_free_pathname;
 set_inode_sus_mount:
 	inode = path.dentry->d_inode;
-	if (!inode) return;
-	spin_lock(&inode->i_lock);
+	if (!inode) {
+		goto out_path_put;
+		return;
+	}
 	if (!(inode->i_state & INODE_STATE_SUS_MOUNT)) {
+		spin_lock(&inode->i_lock);
 		inode->i_state |= INODE_STATE_SUS_MOUNT;
+		spin_unlock(&inode->i_lock);
 		SUSFS_LOGI("set SUS_MOUNT inode state for default KSU mount path '%s'\n", pathname);
 	}
-	spin_unlock(&inode->i_lock);
+out_path_put:
 	path_put(&path);
+out_free_pathname:
+	kfree(pathname);
 }
 #endif // #ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
 #endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
@@ -285,10 +311,11 @@ static int susfs_update_sus_kstat_inode(char *target_pathname) {
 		return 1;
 	}
 
-	spin_lock(&inode->i_lock);
-	inode->i_state |= INODE_STATE_SUS_KSTAT;
-	spin_unlock(&inode->i_lock);
-
+	if (!(inode->i_state & INODE_STATE_SUS_KSTAT)) {
+		spin_lock(&inode->i_lock);
+		inode->i_state |= INODE_STATE_SUS_KSTAT;
+		spin_unlock(&inode->i_lock);
+	}
 	path_put(&p);
 	return 0;
 }
@@ -339,9 +366,8 @@ int susfs_add_sus_kstat(struct st_susfs_sus_kstat* __user user_info) {
 
 	new_entry->target_ino = info.target_ino;
 	memcpy(&new_entry->info, &info, sizeof(info));
-	// only if the target is added statically needs to have flag INODE_STATE_SUS_KSTAT set here,
-	// otherwise the flag INODE_STATE_SUS_KSTAT should be set in function susfs_update_sus_kstat()
-	if (new_entry->info.is_statically && susfs_update_sus_kstat_inode(new_entry->info.target_pathname)) {
+
+	if (susfs_update_sus_kstat_inode(new_entry->info.target_pathname)) {
 		kfree(new_entry);
 		return 1;
 	}
@@ -512,9 +538,10 @@ int susfs_add_try_umount(struct st_susfs_try_umount* __user user_info) {
 }
 
 void susfs_try_umount(uid_t target_uid) {
-	struct st_susfs_try_umount_list *cursor = NULL, *temp = NULL;
+	struct st_susfs_try_umount_list *cursor = NULL;
 
-	list_for_each_entry_safe(cursor, temp, &LH_TRY_UMOUNT_PATH, list) {
+	// We should umount in reversed order
+	list_for_each_entry_reverse(cursor, &LH_TRY_UMOUNT_PATH, list) {
 		SUSFS_LOGI("umounting '%s' for uid: %d\n", cursor->info.target_pathname, target_uid);
 		if (cursor->info.mnt_mode == TRY_UMOUNT_DEFAULT) {
 			ksu_try_umount(cursor->info.target_pathname, false, 0);
@@ -532,7 +559,16 @@ void susfs_auto_add_try_umount_for_bind_mount(struct path *path) {
 	struct st_susfs_try_umount_list *cursor = NULL, *temp = NULL;
 	struct st_susfs_try_umount_list *new_list = NULL;
 	char *pathname = NULL, *dpath = NULL;
+#ifdef CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT
 	bool is_magic_mount_path = false;
+#endif
+
+#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+	if (path->dentry->d_inode->i_state & INODE_STATE_SUS_KSTAT) {
+		SUSFS_LOGI("skip adding path to try_umount list as its inode is flagged INODE_STATE_SUS_KSTAT already\n");
+		return;
+	}
+#endif
 
 	pathname = kmalloc(PAGE_SIZE, GFP_KERNEL);
 	if (!pathname) {
@@ -546,15 +582,21 @@ void susfs_auto_add_try_umount_for_bind_mount(struct path *path) {
 		goto out_free_pathname;
 	}
 
+#ifdef CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT
 	if (strstr(dpath, MAGIC_MOUNT_WORKDIR)) {
 		is_magic_mount_path = true;
 	}
+#endif
 
 	list_for_each_entry_safe(cursor, temp, &LH_TRY_UMOUNT_PATH, list) {
+#ifdef CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT
 		if (is_magic_mount_path && strstr(dpath, cursor->info.target_pathname)) {
-				goto out_free_pathname;
-		} else if (unlikely(!strcmp(dpath, cursor->info.target_pathname))) {
-			SUSFS_LOGE("target_pathname: '%s' is already created in LH_TRY_UMOUNT_PATH\n", dpath);
+			goto out_free_pathname;
+		}
+#endif
+		if (unlikely(!strcmp(dpath, cursor->info.target_pathname))) {
+			SUSFS_LOGE("target_pathname: '%s', ino: %lu, is already created in LH_TRY_UMOUNT_PATH\n",
+							dpath, path->dentry->d_inode->i_ino);
 			goto out_free_pathname;
 		}
 	}
@@ -565,11 +607,17 @@ void susfs_auto_add_try_umount_for_bind_mount(struct path *path) {
 		goto out_free_pathname;
 	}
 
+#ifdef CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT
 	if (is_magic_mount_path) {
-		strncpy(new_list->info.target_pathname, dpath + strlen_debug_ramdisk_workdir, SUSFS_MAX_LEN_PATHNAME-1);
-	} else {
-		strncpy(new_list->info.target_pathname, dpath, SUSFS_MAX_LEN_PATHNAME-1);
+		strncpy(new_list->info.target_pathname, dpath + strlen(MAGIC_MOUNT_WORKDIR), SUSFS_MAX_LEN_PATHNAME-1);
+		goto out_add_to_list;
 	}
+#endif
+	strncpy(new_list->info.target_pathname, dpath, SUSFS_MAX_LEN_PATHNAME-1);
+
+#ifdef CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT
+out_add_to_list:
+#endif
 
 	new_list->info.mnt_mode = TRY_UMOUNT_DETACH;
 
@@ -577,7 +625,8 @@ void susfs_auto_add_try_umount_for_bind_mount(struct path *path) {
 	spin_lock(&susfs_spin_lock);
 	list_add_tail(&new_list->list, &LH_TRY_UMOUNT_PATH);
 	spin_unlock(&susfs_spin_lock);
-	SUSFS_LOGI("target_pathname: '%s', mnt_mode: %d, is successfully added to LH_TRY_UMOUNT_PATH\n", new_list->info.target_pathname, new_list->info.mnt_mode);
+	SUSFS_LOGI("target_pathname: '%s', ino: %lu, mnt_mode: %d, is successfully added to LH_TRY_UMOUNT_PATH\n",
+					new_list->info.target_pathname, path->dentry->d_inode->i_ino, new_list->info.mnt_mode);
 out_free_pathname:
 	kfree(pathname);
 }
@@ -617,16 +666,11 @@ int susfs_set_uname(struct st_susfs_uname* __user user_info) {
 	return 0;
 }
 
-int susfs_spoof_uname(struct new_utsname* tmp) {
+void susfs_spoof_uname(struct new_utsname* tmp) {
 	if (unlikely(my_uname.release[0] == '\0' || spin_is_locked(&susfs_uname_spin_lock)))
-		return 1;
-	strncpy(tmp->sysname, utsname()->sysname, __NEW_UTS_LEN);
-	strncpy(tmp->nodename, utsname()->nodename, __NEW_UTS_LEN);
+		return;
 	strncpy(tmp->release, my_uname.release, __NEW_UTS_LEN);
 	strncpy(tmp->version, my_uname.version, __NEW_UTS_LEN);
-	strncpy(tmp->machine, utsname()->machine, __NEW_UTS_LEN);
-	strncpy(tmp->domainname, utsname()->domainname, __NEW_UTS_LEN);
-	return 0;
 }
 #endif // #ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
 
